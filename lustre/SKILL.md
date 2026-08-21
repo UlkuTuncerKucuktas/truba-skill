@@ -1167,3 +1167,49 @@ read was cold" into a recorded number, and it costs one `lctl get_param`.
 **[v] No standard benchmark is installed** (`fio`, `IOR`, `mdtest`, `elbencho` all
 absent), and GPUDirect Storage is unavailable — so a purpose-built harness is the
 only option on a system like this.
+
+
+## Establish layer baselines before attributing anything
+
+Lustre's own benchmarking methodology (wiki.lustre.org, *Category:Benchmarking*)
+is explicitly **layered**: network -> devices -> OSS -> MDS -> application, each
+baseline established before the layer above it, with a target of *"streaming IO
+performance in excess of 90 % of the measured baseline performance of the
+underlying platform"*.
+
+An unprivileged user can reach exactly **one** of those layers.
+
+| layer | tool | reachable? |
+|---|---|---|
+| network (LNet) | `lnet_selftest` | no — kernel module, root |
+| network (fabric) | **`ib_read_bw`** | **yes — runs between two ordinary compute nodes** |
+| device / LUN | `sgpdd-survey`, VDBench | no — raw device, root |
+| OSS / OST | `obdfilter-survey` | no — runs on the OSS, root |
+| MDS | `mdtest` | MPI; not installed here |
+| application | IOR | not installed here |
+
+**[v] Fabric baseline, measured between two compute nodes:**
+
+```
+ib_read_bw -F -d mlx5_0 -s 1048576 -D 8 --report_gbits
+  -> 239.46 Gb/s average  (~29.9 GB/s)
+```
+
+Compute nodes carry one 400 Gbps NDR port (`mlx5_0`) plus two 40 Gbps ports.
+
+**[v] The resulting attribution:**
+
+| | GB/s | % of fabric |
+|---|---|---|
+| IB fabric point-to-point | **29.9** | 100 % |
+| Lustre client, 16 inodes on one OST | 7.9 | 26 % |
+| Lustre client, **one inode** | 2.3 | **8 %** |
+
+The network is **not** the limit — it is 13x faster than a single-file read. The
+single-inode ceiling is a client-side software limit.
+
+**Consequence for any bandwidth claim made without root:** the device, OSS and
+LNet baselines are unobtainable, so an application-level number cannot be
+attributed to a layer. Metadata **RPC counts** are attributable because they do
+not depend on those layers — which is why they reproduced and the throughput
+numbers did not.
