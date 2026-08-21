@@ -1121,3 +1121,49 @@ The last case is where the large published gains come from (OPRAEL 8.4x on
 128-process IOR writes, TOTO 4.6x). **A striping experiment run below the
 per-object limit is not a test of striping** — it measures whatever caps the
 client first, and will show a null.
+
+
+## Instrumentation actually reachable without root
+
+Most Lustre tuning guides assume root. **[v]** On a 2.15.3 client with
+`/sys/kernel/debug` at `drwx------ root root`, these are **not** readable:
+
+| parameter | why |
+|---|---|
+| `osc.*.brw_stats` | debugfs |
+| `llite.*.job_stats`, `*.jobid_var` | debugfs (though `jobstats` appears in `connect_flags`) |
+| `ldlm.namespaces.*.pool.stats` | debugfs |
+| `osc.*.stats`, `llite.*.stats` | **do not exist on this deployment**, despite appearing in vendor guides |
+| every `lctl set_param` on `llite.*` / `ldlm.*` | `Permission denied` |
+| `lfs setdirstripe` (DNE) | `Operation not permitted` |
+
+Reachable and useful:
+
+```bash
+lctl get_param osc.*.rpc_stats       # pages-per-RPC and RPCs-in-flight histograms
+lctl get_param osc.*.osc_cached_mb   # client cache held per OST  <-- underused
+lctl get_param osc.*.cur_grant_bytes osc.*.max_dirty_mb
+lctl get_param osc.*.max_rpcs_in_flight osc.*.max_pages_per_rpc osc.*.short_io_bytes
+lctl get_param llite.*.max_read_ahead_mb llite.*.max_read_ahead_per_file_mb
+lctl get_param mdc.*.mdc_dom_min_repsize
+```
+
+### `osc_cached_mb` measures the client cache directly
+
+```
+osc.lustre1-OST0000-osc-XXXX.osc_cached_mb=
+used_mb: 850
+busy_cnt: 0
+reclaim: 14672
+```
+
+**[v]** Summed over 48 OSCs on an idle login node: **31,319 MB (~31 GB) resident**
+— consistent with the 32-128 GB effective cache inferred from the throughput
+cliff, but read directly instead of inferred.
+
+**Sample it before and after every measured cell.** It converts "we believe this
+read was cold" into a recorded number, and it costs one `lctl get_param`.
+
+**[v] No standard benchmark is installed** (`fio`, `IOR`, `mdtest`, `elbencho` all
+absent), and GPUDirect Storage is unavailable — so a purpose-built harness is the
+only option on a system like this.
