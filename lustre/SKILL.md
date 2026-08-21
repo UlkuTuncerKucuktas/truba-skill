@@ -651,3 +651,54 @@ known when the layout is set. It cannot adapt to **access pattern** — a file r
 once sequentially and a file re-read randomly get the same layout if they are the
 same size. Size is handled by choosing breakpoints; pattern still needs distinct
 layouts per file class.
+
+
+## Client cache size — and why most I/O benchmarks measure memory
+
+**[v]** Measured on a 251 GB compute node: write a working set on one node, read
+it twice from another, and compare passes.
+
+| working set | cold GB/s | 2nd pass GB/s | speedup |
+|---|---|---|---|
+| 0.25 GB | 2.96 | 21.5 | 7.2x |
+| 2 GB | 6.00 | 49.7 | 8.3x |
+| 8 GB | 6.45 | 53.8 | 8.3x |
+| 32 GB | 6.86 | 57.3 | 8.4x |
+| **128 GB** | 6.79 | 6.53 | **0.96x** |
+
+**The effective client cache is between 32 and 128 GB on a 251 GB node**, and a
+hit is worth about **8x**. Cold streaming sits at 6-7 GB/s.
+
+`llite.*.max_cached_mb` is **[v]** not exposed in this 2.15.3 build, so measure it
+this way rather than reading it.
+
+**Consequence: any benchmark whose working set is under ~32 GB on such a node is
+measuring page cache, not the filesystem.** Layout differences vanish because no
+device is the limit. Size the working set above the cache, or accept that the
+result describes memory.
+
+This also bounds re-read benefits:
+
+```
+expected_cold_reads ~ reads x (1 - min(1, cache / working_set))
+```
+
+Working set far above cache: essentially every read is cold. Far below: only the
+first one is, and features that optimise cold access (DoM, striping width) buy
+nothing on reads 2..N.
+
+## `lfs heat_get` — per-file access counters, usually off
+
+**[v]** Lustre 2.13+ tracks per-file access statistics:
+
+```bash
+lfs heat_get FILE     # flags, readsample, writesample, readbyte, writebyte
+lctl get_param llite.*.file_heat                # 0 = disabled
+lctl get_param llite.*.heat_period_second       # [v] 60
+lctl get_param llite.*.heat_decay_percentage    # [v] 80
+```
+
+**[v]** `file_heat` read **0** on the test system, so all counters stayed at zero
+after repeated reads, and enabling it needs privileges. Where it *is* enabled it
+gives per-file read counts and byte totals with a decaying window, directly from
+the filesystem — no tracing required.
