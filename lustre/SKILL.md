@@ -285,6 +285,25 @@ ceiling** — inlining still worked at 64 KiB, eight times that value. The clien
 grows the reply buffer (`cl_dom_min_inline_repsize` in `mdc_intent_open_pack`),
 so the real boundary must be measured, not read from a parameter.
 
+### Every reader needs its own file set
+
+**[v]** In a 4-node job with one writer and three readers over the *same* files,
+the later readers were faster on **every** arm (e.g. 4 MiB `c=1`: 4138 us on the
+first reader, 3406 us on the second). The first reader pulls the data into the
+**OSS-side** cache and warms the servers for the others.
+
+This looks exactly like node-to-node hardware variance and is not — the nodes
+were verified identical (112 cores, 256 GB, same features) and `OverSubscribe=NO`
+means no other job shared them. Give each reader a disjoint file set.
+
+**Full recipe for an honest cold read:**
+
+1. writer node != reader node
+2. `lfs data_version -w` every file after writing
+3. working set larger than the client cache (see below) — otherwise you measure memory
+4. one file set per reader
+5. `O_DIRECT` as a cross-check, never as the headline number
+
 **Client caching cannot be defeated on the node that wrote the file.** Closing
 the file releases the write lock, but the client keeps pages and locks warm
 enough to erase the effect entirely. **[v]** measured on 500 x 64 KiB files:
@@ -440,7 +459,12 @@ That is **[v] ~3.65 us per additional object**, paid whether or not the object
 holds any data. Together with the layout term, an object that will never hold a
 byte still costs about **4.5 us** on every cold open-and-stat.
 
-**read of one byte** — **[v] flat at ~190 us regardless of stripe count.** A read
+**read of one byte** — **[v] flat at ~190 us regardless of stripe count**, *when
+timed separately from `fstat`*. A harness that calls `fstat()` before the read
+bundles the glimpse into this stage and will report it scaling with width: an
+independent run measuring `open+fstat+read` on 4 MiB files got 304 us at `c=1`
+and 414 us at `c=24`, i.e. **4.79 us per object** — matching the 4.52 us/object
+from the staged decomposition. Same effect, different accounting. A read
 of `[0,1)` needs an extent lock covering only that range, so it touches exactly
 one object. This is the fixed price of talking to an OST at all: LDLM extent
 lock enqueue plus one bulk RPC. **Locks are per extent, not per file** — which is
