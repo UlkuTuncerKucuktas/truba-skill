@@ -773,3 +773,46 @@ measurement — gave **10-20 %**. The cheaper method understates variance by rou
 3x, because it holds OST assignment and server cache state fixed.
 
 Effects below ~10 % need many independent sets, or they cannot be resolved.
+
+
+## Why wide striping buys so little on flash
+
+**[v]** 24 x 64 MiB files, cold cross-node, flushed, 3 independent sets.
+Aggregate GB/s, comparing all files pinned to **one** OST against files spread
+one-per-OST and against every file striped 24-wide:
+
+| threads | one OST | spread (c=1, 16 OSTs) | wide (c=24) |
+|---|---|---|---|
+| 1 | 0.88 | 0.89 | 1.10 |
+| 2 | 1.72 | 1.72 | 2.08 |
+| 4 | 3.14 | 3.28 | 3.92 |
+| 8 | 5.47 | 5.89 | 6.61 |
+| 16 | 5.93 | 7.44 | 8.43 |
+| 32 | **7.21** | 9.08 | **10.09** |
+
+**A single OST reached 7.2 GB/s — within ~30 % of the client's ~10 GB/s
+ceiling.** Going from 1 OST to 24 bought only **1.2-1.4x** at any thread count,
+while raising client threads from 1 to 32 bought **8x**.
+
+**Client concurrency is the dominant lever; stripe width is a minor one.**
+
+The reason is historical. Striping exists to aggregate devices that are
+individually too slow to feed a client. With HDD-era OSTs at 100-200 MB/s you
+needed tens of stripes to saturate a client. On flash, one target already
+supplies most of what a single client can consume, so the saturation bound is:
+
+```
+useful_stripes ~ min( ceil(size / stripe_size),          # spanning bound
+                      client_ceiling / per_OST_rate )    # saturation bound
+```
+
+**[v]** On this system the saturation bound is roughly **2**. Every object beyond
+it costs 4.44 us of glimpse on each cold access and returns nothing.
+
+Note the one-OST figure is an upper bound on what that target can serve from a
+mix of its cache and media; the point stands either way, since it is already
+near the client ceiling.
+
+Related: shared-file access is known to lose to file-per-process because of LDLM
+extent-lock contention on one inode; Lustre's answer is **overstriping**
+(`lfs setstripe -C`, more than one stripe per OST), which was not tested here.
