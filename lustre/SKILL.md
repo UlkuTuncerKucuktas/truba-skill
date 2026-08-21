@@ -972,3 +972,44 @@ for free) is worth ~1.26x at this scale; per-file stripe count is worth nothing
 and costs the width tax. Wide striping remains defensible for **capacity** (files
 larger than one OST) and plausibly at much larger client counts, neither of which
 is measured here.
+
+
+## Other read-side features: what exists, what is on, what helps
+
+**[v]** Everything reachable by an unprivileged user, measured on the same system.
+
+| feature | state here | effect on reads |
+|---|---|---|
+| **LSOM** (Lazy Size on MDT) | **disabled** — `lfs getsom` returns `No data available (61)` | would remove the glimpse entirely; admin-only |
+| **PCC** (Persistent Client Cache) | `lfs pcc` exists, **no backend configured** | client-local NVMe cache; admin-only |
+| **statahead + AGL** | **enabled** (`statahead_agl=1`, max 32) | **[v] no effect on the width tax** |
+| **FLR mirroring** | works (`lfs mirror extend` -> 2 mirrors) | **[v] 0.92x** |
+| **Overstriping** `-C 48` | works, granted 48 on a 24-OST pool | **[v] 0.99x** |
+| **`ladvise willread`** | works | **[v] 1.08x** |
+| **`ladvise dontneed`** | accepted | **[v] no effect** |
+| **opencache** | on: 5 opens / 100 ms, 60 s TTL | only helps repeated opens of the same file |
+
+### statahead does not hide the glimpse
+
+Async Glimpse Lock is meant to prefetch sizes during directory traversal, so a
+sequential scan might avoid the per-object cost. **[v]** It does not, for the
+open-then-fstat pattern: 2000 x 64 KiB files, cold, readdir order versus random
+order:
+
+| layout | order | `fstat` |
+|---|---|---|
+| c=1 | readdir | 54.3 us |
+| c=1 | random | 50.7 us |
+| c=24 | readdir | 165.4 us |
+| c=24 | random | 149.5 us |
+
+Width tax **4.83 us/object** scanning in order, **4.30 us/object** at random — the
+same value either way, and the sixth independent confirmation of ~4.4 us/object.
+
+### LSOM is the feature that would fix it
+
+Lustre 2.12+ can store the size on the MDT so `stat()` needs no OST RPC at all.
+It is **off by default** and off here, which is why the glimpse tax is what most
+sites actually pay. Turning it on is an administrator action
+(`mdt.*.enable_lsom`), and the stored size is *lazy* — accurate enough for
+scanners and policy engines, not for strict `stat()` semantics.
