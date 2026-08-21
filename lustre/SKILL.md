@@ -572,6 +572,49 @@ Note: `lfs getstripe` prints objects differently for composite layouts, so a
 parser that counts plain `obdidx` lines reports 0 objects for a PFL file. Count
 per component instead.
 
+## Stripe size caps RPC size — the single most important layout interaction
+
+A bulk RPC cannot cross a stripe boundary, so **stripe size, not
+`max_pages_per_rpc`, is what actually sets RPC granularity.**
+
+**[v]** 64 MiB files, T=8, 3 independent cold sets, both pools on the same 12 OSS
+servers:
+
+| pool | layout | RPCs/file | mean RPC | GB/s | vs `c=1 S=1M` |
+|---|---|---|---|---|---|
+| flash | c=1 S=1M | 15 | 9970 KiB | 4.47 | 1.00x |
+| flash | c=4 S=1M | 21 | 3415 KiB | 4.44 | 1.00x |
+| flash | c=24 S=1M | **141** | **635 KiB** | 5.51 | 1.23x |
+| flash | c=4 S=16M | 15 | 4507 KiB | 5.42 | **1.21x** |
+| flash | c=24 S=16M | 15 | 4507 KiB | 5.24 | 1.17x |
+| disk | c=1 S=1M | 15 | 9971 KiB | 4.10 | 1.00x |
+| disk | **c=24 S=1M** | **141** | **634 KiB** | **1.34** | **0.33x** |
+| disk | c=4 S=16M | 15 | 4507 KiB | 4.80 | 1.17x |
+| disk | **c=24 S=16M** | 15 | 4507 KiB | 4.93 | **1.20x** |
+
+Striping 24-wide **with the default 1 MiB stripe** fragments a file's read from
+15 RPCs into **141**, each about 635 KiB. Raising the stripe size to 16 MiB puts
+the count straight back to 15.
+
+**The consequence differs by media, and this is where tiers actually diverge:**
+
+- **Flash absorbs fragmentation** — 141 small RPCs still delivered 1.23x.
+- **Spinning media does not** — the identical RPC pattern gave **0.33x**, since
+  each small request lands as a seek.
+- **Correct the stripe size and the difference vanishes** — `c=24 S=16M` gives
+  1.20x on disk and 1.17x on flash.
+
+So "wide striping hurts on HDD" is really "**the default 1 MiB stripe size is
+pathological for wide layouts**". Keep `stripe_size` at or near
+`max_pages_per_rpc` whenever `stripe_count` is large.
+
+This is also the cleanest evidence that media *is* reachable through the server
+cache: two pools on the same twelve OSS nodes, driven by an identical RPC
+pattern, diverged **3.7x**. Cache alone cannot produce that.
+
+**[v]** Both pools are served by the **same 12 OSS nodes**; disk OSTs are 454 TiB
+each against 81.8 TiB for flash. Same network, same servers, different media.
+
 ## Stripe size is a spanning control
 
 **[v]** Same 4 MiB file, same `c=4`, cold:
