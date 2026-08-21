@@ -1,20 +1,22 @@
-# TRUBA skill for Claude Code
+# HPC skills for Claude Code
 
-A Claude Code skill for working on [TRUBA](https://docs.truba.gov.tr), the Turkish
-national HPC infrastructure (TÜBİTAK ULAKBİM).
+Two [Claude Code](https://claude.com/claude-code) skills for high-performance
+computing work.
 
-It covers connecting to the login nodes, which partition lives on which cluster,
-the SLURM rules that only ever show up as a submit rejection, the `/arf` Lustre
-filesystem (striping, pools, quotas, Data-on-MDT), module and Python policy, and
-a symptom-to-cause table for common job failures.
+| Skill | Covers |
+|---|---|
+| [`truba/`](truba/SKILL.md) | [TRUBA](https://docs.truba.gov.tr), the Turkish national HPC infrastructure: login nodes, which partition lives on which cluster, the SLURM rules that only ever surface as a submit rejection, `/arf` storage and purge policy, module and Python policy, and a symptom-to-cause table for job failures. |
+| [`lustre/`](lustre/SKILL.md) | The Lustre parallel filesystem: layouts and striping, composite layouts (PFL) and Data-on-MDT, LDLM locking and what an `open()` costs, client RPC and readahead tunables, caching, and how to benchmark honestly without root. |
 
-Facts marked **[v]** were verified on the machine; the rest come from the official
-documentation.
+Facts marked **[v]** were verified by running the command on a production
+system rather than taken from documentation. Measured values illustrate one
+site; read them back on yours.
 
 ## Install
 
 ```bash
-git clone https://github.com/UlkuTuncerKucuktas/truba-skill ~/.claude/skills/truba
+git clone https://github.com/UlkuTuncerKucuktas/truba-skill /tmp/hpc-skills
+cp -r /tmp/hpc-skills/truba /tmp/hpc-skills/lustre ~/.claude/skills/
 ```
 
-Claude Code picks it up automatically and loads it when a task touches TRUBA.
+Claude Code loads each one automatically when a task touches it.
