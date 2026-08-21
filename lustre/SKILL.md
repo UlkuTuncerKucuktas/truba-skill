@@ -398,3 +398,86 @@ latency is dominated by queueing rather than layout. **Record aggregate
 throughput as well as per-file latency** — at T=32 the median latency rose while
 the arms became indistinguishable, and the two numbers answer different
 questions.
+
+
+## The read path, stage by stage
+
+**[v]** Cold, cross-node, writer-flushed, T=1, medians in microseconds. Each stage
+measured on a disjoint set of 100 files so every one is a first touch. `BRW` is
+the delta in OST bulk-read RPCs per file, from `osc.*.rpc_stats`.
+
+| arm | `open` | `fstat` | read 1 B | read all | BRW/file |
+|---|---|---|---|---|---|
+| DoM 4 KiB | 120.0 | **3.7** | 3.7 | 9.7 | **0.00** |
+| DoM 64 KiB | 208.7 | **3.8** | 3.7 | 14.8 | **0.00** |
+| OST 4 KiB `c=1` | 59.9 | 51.1 | 197.4 | 195.0 | 3.0 |
+| OST 64 KiB `c=1` | 63.1 | 49.2 | 190.6 | 557.8 | 3.0 |
+| OST 64 KiB `c=24` | 81.9 | **131.6** | 189.8 | 732.1 | 3.0 |
+| OST 4 MiB `c=1` | 62.5 | 46.7 | 189.7 | 3025.8 | 6.0 |
+| OST 4 MiB `c=4` | 64.5 | 57.7 | 191.5 | **2498.2** | 12.0 |
+| OST 4 MiB `c=24` | 82.2 | **130.9** | 195.1 | 2672.7 | 12.0 |
+
+### What each stage is
+
+**`open`** — one `MDS_OPEN` intent RPC to the MDT via the MDC. It returns the
+inode attributes, the open handle, and the **layout** (which OSTs hold the
+objects). It does *not* return the file size for an OST file. Cost grows weakly
+with stripe count — **[v] ~0.87 us per object** — because the layout itself is
+bigger.
+
+**`fstat` — the size query, and this is where width is charged.** The
+authoritative file size lives on the OSTs: each object knows its own length, and
+the MDT does not. So the client must **glimpse every stripe** and sum the
+results. **[v]** the cost scales with stripe count:
+
+| stripes | `fstat` |
+|---|---|
+| 1 | ~47-51 us |
+| 4 | ~58 us |
+| 24 | **~131 us** |
+
+That is **[v] ~3.65 us per additional object**, paid whether or not the object
+holds any data. Together with the layout term, an object that will never hold a
+byte still costs about **4.5 us** on every cold open-and-stat.
+
+**read of one byte** — **[v] flat at ~190 us regardless of stripe count.** A read
+of `[0,1)` needs an extent lock covering only that range, so it touches exactly
+one object. This is the fixed price of talking to an OST at all: LDLM extent
+lock enqueue plus one bulk RPC. **Locks are per extent, not per file** — which is
+why the width penalty appears in the size query, not in the data path.
+
+**read all** — bulk transfer, LNet RDMA, `max_pages_per_rpc` (**[v]** 4096 pages
+= 16 MiB) per BRW RPC. This is the stage width actually helps: 4 MiB over four
+objects (2498 us) beats the same file on one (3026 us), while spreading it over
+24 (2673 us) is worse again because twenty of them are empty.
+
+**DoM** short-circuits the whole sequence. The data rides back in the `open`
+reply, so `open` grows with file size (120 -> 209 us from 4 to 64 KiB) while
+`fstat` costs **3.7 us** (the MDT already told the client the size) and the read
+is a memcpy. **[v] Zero OST bulk RPCs** — proof the data never reaches an OST.
+
+### Three small-I/O regimes, not one
+
+**[v]** `osc.*.short_io_bytes` = **16384**. Reads and writes at or below that size
+are carried inline in the RPC instead of by bulk RDMA — an OST-side inline path
+*independent of DoM*. That creates three regimes:
+
+| size | OST path | DoM advantage |
+|---|---|---|
+| <= 16 KiB | short I/O, inline, no RDMA | smaller — OST is inlining too (**[v]** 1.78x at 4 KiB) |
+| 16 KiB .. inline cliff | bulk RDMA | largest (**[v]** 3.0-3.7x) |
+| above the cliff | bulk RDMA | gone (**[v]** 1.09x at 128 KiB) |
+
+A DoM evaluation that samples only very small files understates the benefit,
+because `short_io` is competing with it there.
+
+### The cost model this implies
+
+```
+cold read latency  ~  open(layout)      + 0.87 us x objects_allocated
+                    + glimpse(size)     + 3.65 us x objects_allocated
+                    + extent lock + BRW ~ 190 us fixed
+                    + bulk transfer     / objects_with_data
+```
+where `objects_with_data = min(stripe_count, ceil(size / stripe_size))`. Objects
+beyond that bound contribute only to the first two terms — they are pure cost.
