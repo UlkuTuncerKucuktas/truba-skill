@@ -780,9 +780,25 @@ Effects below ~10 % need many independent sets, or they cannot be resolved.
 **Read this before trusting any GB/s number below, including ones in this file.**
 
 Client cache can be defeated (different node, writer flush, working set above
-~32 GB). **Server cache cannot.** Dropping an OSS page cache needs root, so the
-only lever is writing more than the servers can hold — and aggregate OSS RAM
-across dozens of targets is likely multiple TB, well past a normal user quota.
+~32 GB). **Server cache cannot.**
+
+**[v] `lfs ladvise -a dontneed` does not help.** It is accepted, returns rc=0 in
+3-6 ms, and takes many files per invocation — but it changed read throughput not
+at all: control 5.10 GB/s, dontneed issued from the writer 5.22, from the reader
+5.38. `ladvise` is advisory and the OSS is free to ignore it. Dropping an OSS
+page cache, or setting `obdfilter.*.readcache_max_filesize=0`, needs root. The
+remaining lever is writing more than the servers can hold, and aggregate OSS RAM
+across dozens of targets is likely multiple TB — past a normal user quota.
+
+**[v] There is a deeper reason the distinction is unreachable.** Cross-node reads
+land at **5-10 GB/s whatever the conditions**, while same-node client-cache reads
+reach 40-57 GB/s. The client/network path is the bottleneck for any read that
+crosses the wire, and both OSS cache and flash media can saturate it. So for
+**flash**, cache and media are indistinguishable *because neither is the limit* —
+which means flash-only bulk numbers are defensible as measurements of the client
+path. For **capacity/HDD pools they are not**: a spinning pool returning
+11.68 GB/s is being answered from server memory, so any flash-versus-disk
+comparison measured this way is meaningless.
 
 **[v]** The symptom is unmistakable once you look for it: in one run a
 **spinning-disk** pool returned **11.68 GB/s** on a sequential read while flash
