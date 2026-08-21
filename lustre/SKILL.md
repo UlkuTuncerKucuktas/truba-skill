@@ -159,8 +159,8 @@ object regardless of width):
 | 8 | 1476 us | 82 us | 1370 us |
 | 24 | 1638 us | 98 us | 1481 us |
 
-Width costs about **9.5 us per allocated object**, and roughly seven eighths of
-it lands in the **first read**, not the open. Lustre's `open` returns the layout;
+Width costs roughly **9.5 us per allocated object**, and most of it lands in the
+**first read**, not the open. Lustre's `open` returns the layout;
 the extent locks are enqueued when I/O actually happens. So a harness that times
 only `open()` will miss the effect almost entirely — decompose into
 open / first-read / rest-read.
@@ -233,6 +233,57 @@ The naive number is **8x** the honest one. `O_DIRECT` **[v] works on Lustre** an
 is a far cheaper client-cache bypass than writing 64 GiB per cell — but it also
 disables readahead, so it measures a different I/O path, not just a colder one.
 Use it as a control arm, not as the headline configuration.
+
+### The writer must flush, or you measure lock revocation
+
+Reading from a second node is necessary but **not sufficient**. The writing node
+still holds the write locks, so the reader's request forces blocking callbacks
+back to it. That inflates every number — and, fatally, it inflates them
+*unequally*:
+
+```bash
+lfs data_version -w FILE      # writer flush: push data AND release the write lock
+```
+
+**[v]** 200 files per arm, written on one node, read cold from another:
+
+| arm | no flush | flushed | inflation |
+|---|---|---|---|
+| DoM 64 KiB | 883 us | **212 us** | **4.17x** |
+| OST 64 KiB | 1054 us | 637 us | 1.65x |
+| DoM 4 KiB | 388 us | 156 us | 2.49x |
+| OST 4 KiB | 507 us | 277 us | 1.83x |
+
+Skipping the flush costs DoM 4.2x and OST 1.7x, so it does not cancel in a
+ratio — it **destroys the DoM signal specifically**, turning a 3x speedup into a
+1.2x one. Any DoM comparison without a writer flush is measuring the wrong thing.
+
+`lfs data_version -w` is the reliable interface. The underlying
+`LL_IOC_DATA_VERSION` ioctl is **[v]** not straightforwardly callable from Python
+(the obvious `_IOR('f', 249, 16)` encoding returns `ENOTTY`); shelling out per
+file is fine because it belongs in the write phase, outside any timed region.
+
+### DoM inlining has a visible cliff
+
+**[v]** Cross-node, flushed, 200 files, T=1 — the `first_read / open` split is the
+discriminator:
+
+| size | DoM total | DoM open | DoM first read | OST total | OST/DoM |
+|---|---|---|---|---|---|
+| 4 KiB | 155 us | 145 | **5.2** | 277 us | 1.78x |
+| 16 KiB | 168 us | 157 | **6.2** | 618 us | **3.67x** |
+| 64 KiB | 212 us | 197 | **9.4** | 637 us | **3.01x** |
+| 128 KiB | 599 us | 66 | **526** | 651 us | 1.09x |
+
+Below the cliff the data arrives *with the open* — the read is a few
+microseconds of memcpy and `open` carries the cost. Above it, `open` falls back
+to a normal ~66 us and the read costs a full round trip. The benefit collapses
+from 3x to 1.1x between 64 and 128 KiB.
+
+`mdc.*.mdc_dom_min_repsize` (**[v]** 8192) is confirmed to be a **floor, not a
+ceiling** — inlining still worked at 64 KiB, eight times that value. The client
+grows the reply buffer (`cl_dom_min_inline_repsize` in `mdc_intent_open_pack`),
+so the real boundary must be measured, not read from a parameter.
 
 **Client caching cannot be defeated on the node that wrote the file.** Closing
 the file releases the write lock, but the client keeps pages and locks warm
@@ -324,3 +375,26 @@ the counter window exactly where the measured phase ends.
   measurement by **1.29x at T=32 versus 1.05x at T=1**, manufacturing a penalty
   that looks exactly like a client-side concurrency ceiling. Build the pool and
   drive every worker through a `threading.Barrier` *before* starting the clock.
+
+
+## Width: cost, benefit, and the interior optimum
+
+**[v]** Cross-node, writer-flushed, median per-file latency relative to `-c 1`:
+
+| file size | spans | w=4 | w=8 | w=24 |
+|---|---|---|---|---|
+| 256 KiB (T=1) | 1 object | 1.12x | 1.12x | **1.30x** |
+| 1 MiB (T=1) | 1 object | 1.09x | 1.06x | 1.22x |
+| 4 MiB (T=1) | 4 objects | **0.88x** | **0.88x** | 0.91x |
+
+With a 1 MiB stripe, a file's data occupies `ceil(size / stripe_size)` objects
+however wide the layout is. Below that bound width is pure cost; at or above it
+width buys real parallelism. A 4 MiB file spans four objects, and the optimum
+sits at **w=4-8 — neither 1 nor the maximum** — because w=24 adds twenty empty
+objects that still cost locks.
+
+At high concurrency (T=32) the differences compress toward 1.0x: per-file
+latency is dominated by queueing rather than layout. **Record aggregate
+throughput as well as per-file latency** — at T=32 the median latency rose while
+the arms became indistinguishable, and the two numbers answer different
+questions.
