@@ -89,7 +89,14 @@ Hard rules, each of which shows up only as a rejection or a dead job:
 - `#SBATCH` lines are comments parsed before any shell runs, so **they cannot
   read environment variables**. Put site-varying geometry (core counts) on the
   command line, where it overrides the header.
-- The working directory must be under `/arf/scratch`.
+- **The working directory must be under `/arf/scratch`** — enforced by a submit
+  filter, **[v]** not just policy:
+  `srun: error: Lutfen islerinizi /arf/scratch/ dizini altinda calistiriniz!`
+  followed by a misleading `Job violates accounting/QOS policy` line. `cd` into
+  scratch before submitting.
+- **`/tmp` is node-local.** **[v]** A script written on the login node is not
+  visible to a compute node — put anything a job must read under `/arf`. `/tmp`
+  is still the right place for node-local scratch *inside* a job.
 - Give a *realistic* `--time`. The scheduler backfills, so an honest short limit
   starts sooner than a padded one.
 - Add `--no-requeue` for jobs without checkpointing; node failures otherwise
@@ -99,6 +106,19 @@ Interactive:
 
 ```bash
 srun -p debug -C barbun -N 1 -n 1 -c 20 -A <username> -J test --time=0:30:00 --pty /usr/bin/bash -i
+```
+
+**[v]** `srun` also works non-interactively for one-shot runs
+(`srun -p debug -C orfoz -N1 -n1 -c56 -A $USER --time=0:20:00 python3 x.py`), and
+`debug` turned a two-node job around in about a minute. For work that needs two
+distinct clients — the only reliable way to get a cold filesystem read:
+
+```bash
+#SBATCH -N 2
+#SBATCH --ntasks-per-node=1
+NODES=($(scontrol show hostnames $SLURM_JOB_NODELIST))
+srun -N1 -n1 -w ${NODES[0]} python3 bench.py write
+srun -N1 -n1 -w ${NODES[1]} python3 bench.py read
 ```
 
 Per-node core counts for the `-c` argument: orfoz 55, hamsi 54, barbun 20,
@@ -126,7 +146,7 @@ scontrol show partition debug
 **Nothing is backed up.** Scratch is swept periodically.
 
 **[v]** `lfs quota -u $USER /arf` reports the default setting with no enforced
-block or inode limit, and an account was observed at 910 GB / 1.75 M files —
+block or inode limit, and one account was sitting at 910 GB / 1.75 M files —
 well past the documented 500K inodes. Treat the documented quota as policy that
 may be enforced later, not as a limit the filesystem will stop you at.
 

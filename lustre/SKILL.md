@@ -144,10 +144,26 @@ performance work:
 > **The client enqueues a lock for each stripe of the file, to the respective
 > OST.**
 
-So an open pays lock enqueues proportional to the number of objects, plus a
-glimpse to learn the file size. That is a per-object constant paid whether or
-not the object holds data — the mechanism behind "wide layouts are slower for
+So the client pays lock enqueues proportional to the number of objects, plus a
+glimpse to learn the file size — a per-object constant paid whether or not the
+object holds data. This is the mechanism behind "wide layouts are slower for
 small files".
+
+**[v] It is not charged to `open()`.** Measured cold from a second node on
+200 x 256 KiB files (every file smaller than one stripe, so all data sits on one
+object regardless of width):
+
+| width | total | `open` | first read |
+|---|---|---|---|
+| 1 | 1420 us | 81 us | 1332 us |
+| 8 | 1476 us | 82 us | 1370 us |
+| 24 | 1638 us | 98 us | 1481 us |
+
+Width costs about **9.5 us per allocated object**, and roughly seven eighths of
+it lands in the **first read**, not the open. Lustre's `open` returns the layout;
+the extent locks are enqueued when I/O actually happens. So a harness that times
+only `open()` will miss the effect almost entirely — decompose into
+open / first-read / rest-read.
 
 DoM instead takes "a single lock covering the entire data range on the MDT
 object", which is why its open is cheap and its read is nearly free.
@@ -204,6 +220,34 @@ cache hit, not a result. If no device was the limit, spreading data over more
 devices cannot help — a null under those conditions is a property of the
 measurement.
 
+**[v] Measured, one client, 100 x 20 MiB working set, `-c 1`:**
+
+| condition | aggregate |
+|---|---|
+| read immediately after writing | **39.5 GiB/s** |
+| after writing 16 GiB more | 24.5 GiB/s |
+| after writing 64 GiB more | 7.3 GiB/s |
+| `O_DIRECT`, no filler | 5.0 GiB/s |
+
+The naive number is **8x** the honest one. `O_DIRECT` **[v] works on Lustre** and
+is a far cheaper client-cache bypass than writing 64 GiB per cell — but it also
+disables readahead, so it measures a different I/O path, not just a colder one.
+Use it as a control arm, not as the headline configuration.
+
+**Client caching cannot be defeated on the node that wrote the file.** Closing
+the file releases the write lock, but the client keeps pages and locks warm
+enough to erase the effect entirely. **[v]** measured on 500 x 64 KiB files:
+DoM 78.1 us vs OST 77.8 us — *no difference at all* — when the reader ran on the
+writer's node. The same comparison from a **second node in the same job** gave
+DoM 908 us vs OST 1056 us. The reliable recipe for a cold small-file read is:
+
+```bash
+#SBATCH -N 2
+NODES=($(scontrol show hostnames $SLURM_JOB_NODELIST))
+srun -N1 -n1 -w ${NODES[0]} python3 bench.py write
+srun -N1 -n1 -w ${NODES[1]} python3 bench.py read     # never saw these files
+```
+
 ## Changing a layout after creation
 
 A layout is fixed at creation and writes cannot alter it. Lustre allocates it at
@@ -257,3 +301,26 @@ lctl list_param osc.*.rpc_stats     # [v] present; llite.*.stats was not
 
 **[v]** Stats cannot be cleared without privileges, so take deltas, and close
 the counter window exactly where the measured phase ends.
+
+
+## Benchmarking Lustre from Python
+
+**[v]** Measured on a 2.15.3 client, Python 3.9:
+
+- `os.pread`, `os.preadv`, `os.pwrite`, `os.posix_fadvise`, `os.sched_setaffinity`
+  and `os.O_DIRECT` are all available. `perf_counter_ns` resolves to ~85 ns
+  back-to-back, which is negligible against microsecond-scale I/O.
+- **The interpreter adds roughly 20-27 us per file** (open + reads + close),
+  measured against fully cached node-local files. That is ~2 % of a millisecond
+  Lustre read and **~30 % of a small DoM read** — so it is negligible for
+  striping work on files of 256 KiB and up, and *not* negligible in the
+  small-file regime. Measure this floor on the same node in the same run and
+  report it.
+- The floor is **flat in thread count** (23.7 / 28.8 / 28.3 / 26.9 us at
+  T = 1 / 4 / 16 / 32), so the GIL does not degrade with concurrency here.
+- **`ThreadPoolExecutor` spawns workers lazily, and the cost scales with the
+  pool size** — **[v]** 389 / 610 / 1213 / 2153 us to create and spawn 1 / 4 /
+  16 / 32 workers. Timing a region that includes pool construction inflated the
+  measurement by **1.29x at T=32 versus 1.05x at T=1**, manufacturing a penalty
+  that looks exactly like a client-side concurrency ceiling. Build the pool and
+  drive every worker through a `threading.Barrier` *before* starting the clock.
