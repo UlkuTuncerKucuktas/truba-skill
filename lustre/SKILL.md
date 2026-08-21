@@ -726,3 +726,50 @@ lctl get_param llite.*.heat_decay_percentage    # [v] 80
 after repeated reads, and enabling it needs privileges. Where it *is* enabled it
 gives per-file read counts and byte totals with a decaying window, directly from
 the filesystem — no tracing required.
+
+
+## The width tax, measured properly
+
+**[v]** Dense sweep, cold cross-node, writer-flushed, **4 independent disjoint
+file sets per cell** (not re-reads), 60 files each, randomised cell order, T=1.
+`fstat` median in microseconds:
+
+| file size | c=1 | c=2 | c=4 | c=8 | c=16 | c=24 | slope |
+|---|---|---|---|---|---|---|---|
+| 1 MiB | 57.6 | 65.8 | 72.3 | 92.0 | 127.5 | 159.5 | 4.40 |
+| 2 MiB | 62.1 | 66.6 | 73.9 | 93.5 | 128.1 | 175.6 | 4.86 |
+| 4 MiB | 61.7 | 69.0 | 76.0 | 94.4 | 138.4 | 164.5 | 4.56 |
+| 8 MiB | 67.5 | 71.8 | 82.7 | 101.9 | 130.7 | 158.6 | 3.96 |
+
+**~4.44 us per allocated object, and independent of file size** — exactly as a
+per-object glimpse should behave. Five independent measurements across different
+code and days now agree: 4.40, 4.56, 4.86, 3.96 here, plus 4.52 from a staged
+decomposition and 4.79 from a run that bundled `fstat` into the read.
+
+## Striping width stops paying as concurrency rises
+
+**[v]** 4 MiB files, aggregate throughput relative to `c=1`:
+
+| threads | c=2 | c=4 | c=8 | c=24 |
+|---|---|---|---|---|
+| 1 | 0.97x | **1.17x** | 1.16x | 1.02x |
+| 4 | 1.07x | 1.11x | 1.09x | 1.05x |
+| 16 | 0.91x | 0.96x | 0.89x | 0.92x |
+
+At one reader, striping a 4 MiB file across 4-8 OSTs is worth ~17 %. **At 16
+readers every wide layout is worse than `c=1`.** With many files in flight the
+client is already spread across OSTs — file-level parallelism substitutes for
+stripe-level parallelism — so extra stripes per file add glimpse cost and buy
+nothing.
+
+Practical consequence: a multi-worker dataloader over many files wants **narrow**
+stripes, not wide ones.
+
+## Independent file sets reveal the true variance
+
+**[v]** Re-reading the same files across "repeats" gave 1-8 % run-to-run spread.
+Using **disjoint file sets per repeat** — the only honest way to repeat a cold
+measurement — gave **10-20 %**. The cheaper method understates variance by roughly
+3x, because it holds OST assignment and server cache state fixed.
+
+Effects below ~10 % need many independent sets, or they cannot be resolved.
