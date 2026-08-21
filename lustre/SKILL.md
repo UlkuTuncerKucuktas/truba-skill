@@ -775,6 +775,35 @@ measurement — gave **10-20 %**. The cheaper method understates variance by rou
 Effects below ~10 % need many independent sets, or they cannot be resolved.
 
 
+## Bulk throughput cannot be measured honestly from an unprivileged account
+
+**Read this before trusting any GB/s number below, including ones in this file.**
+
+Client cache can be defeated (different node, writer flush, working set above
+~32 GB). **Server cache cannot.** Dropping an OSS page cache needs root, so the
+only lever is writing more than the servers can hold — and aggregate OSS RAM
+across dozens of targets is likely multiple TB, well past a normal user quota.
+
+**[v]** The symptom is unmistakable once you look for it: in one run a
+**spinning-disk** pool returned **11.68 GB/s** on a sequential read while flash
+returned 12.50 GB/s — indistinguishable, and both impossible for the media. Total
+volume was ~129 GB over 48 OSTs, about 2.7 GB per target, entirely resident in
+OSS memory.
+
+The practical split, and it matches which results reproduce:
+
+| quantity | cache-dependent? | reproducibility observed |
+|---|---|---|
+| per-object glimpse cost | no — a metadata RPC count | **five independent runs agreed** |
+| DoM inline cliff location | no — RPC structure | two runs, same bracket |
+| PFL avoiding the glimpse tax | no — metadata | consistent |
+| bulk GB/s, striping benefit, pool tier gap | **yes** | **differed every run** |
+
+Metadata-path costs are measurable on a production system because they are RPC
+counts. Bulk-transfer results are not, unless you can drop server caches. Treat
+the throughput tables below as *bounded by server cache*, not as media
+behaviour.
+
 ## Why wide striping buys so little on flash
 
 **[v]** 24 x 64 MiB files, cold cross-node, flushed, 3 independent sets.
@@ -809,9 +838,13 @@ useful_stripes ~ min( ceil(size / stripe_size),          # spanning bound
 **[v]** On this system the saturation bound is roughly **2**. Every object beyond
 it costs 4.44 us of glimpse on each cold access and returns nothing.
 
-Note the one-OST figure is an upper bound on what that target can serve from a
-mix of its cache and media; the point stands either way, since it is already
-near the client ceiling.
+**Caveat, and it is a large one:** the one-OST figure of 7.2 GB/s is far above
+what a single storage target should sustain from media, so these reads were
+substantially served from OSS cache. The *relative* comparison at equal cache
+state is still informative — width bought 1.2-1.4x while threads bought 8x — but
+do not read the absolute rates, or the flash-versus-disk comparison, as media
+behaviour. A companion run on the capacity pool produced an implausible
+11.68 GB/s, confirming that the servers, not the disks, were answering.
 
 Related: shared-file access is known to lose to file-per-process because of LDLM
 extent-lock contention on one inode; Lustre's answer is **overstriping**
