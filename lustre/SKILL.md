@@ -586,3 +586,68 @@ lfs ladvise -a willread -s 0 -e <bytes> FILE    # ask the OSS to prefetch
 about **1.08x**. Available unprivileged, genuinely works, but not large enough to
 build on. `-a dontneed` and `-m READ|WRITE` (lock-ahead) exist on the same
 command and were not measured.
+
+
+## Composing PFL layouts: what the rules actually are
+
+**[v] DoM is a PFL component, not a separate feature.** `-L mdt` is a component
+type, so one layout can go MDT -> narrow -> wide:
+
+```bash
+lfs setstripe -E 128K -L mdt -E 8M -c 1 -S 1M -E -1 -c 8 -S 4M DIR
+```
+
+**[v]** granted as three components: `mdt` (stripe_count 0), then `c=1 S=1M`,
+then `c=8 S=4M`.
+
+**[v] Every component may set its own stripe size**, and they are honoured
+independently:
+
+```bash
+lfs setstripe -E 4M -c 1 -S 1M -E 64M -c 4 -S 4M -E -1 -c 24 -S 16M DIR
+```
+
+**[v] FOOTGUN: omit `-S` and the DoM extent silently sets the stripe size for the
+whole layout.** With `-E 64K -L mdt -E 1M -c 1 -E 64M -c 4 -E -1 -c 24` and no
+`-S` anywhere, **every** component came back with `stripe_size: 65536` — a 64 KiB
+stripe on the 24-wide component, which would be badly wrong for large files.
+A DoM component's stripe size equals its extent, and later components inherit it
+rather than the filesystem default. **Always state `-S` explicitly per
+component.**
+
+**[v] Extent ends must be a multiple of that component's stripe size.**
+`-E 3M -c 1 -S 2M` is refused outright:
+
+```
+Invalid layout: The component end must be aligned by the stripe size
+```
+
+So stripe size does not merely influence where breakpoints should go — it
+**constrains where they can go**.
+
+**[v]** At least 8 components are accepted. Instantiation follows file growth:
+with `128K mdt | 8M c=1 | rest c=8`, a 64 KiB file had 1 component instantiated,
+a 4 MiB file 2, a 32 MiB file 3.
+
+**[v] A per-file `lfs setstripe` before creation overrides the directory
+default**, so one dataset can mix layouts and stripe sizes file by file.
+
+### Choosing breakpoints
+
+Two couplings between breakpoints and stripe size:
+
+1. **Hard:** each extent end must be a multiple of that component's stripe size.
+2. **Performance:** a component with count `C` and stripe size `S` only uses all
+   `C` objects once the file carries `C x S` bytes inside that extent. Widening
+   before that point buys nothing and still costs a glimpse per object.
+
+So a sensible component boundary sits at or above `stripe_count x stripe_size`
+for the component it opens.
+
+### What PFL does and does not solve
+
+PFL adapts to **file size**, automatically, per file, without the size being
+known when the layout is set. It cannot adapt to **access pattern** — a file read
+once sequentially and a file re-read randomly get the same layout if they are the
+same size. Size is handled by choosing breakpoints; pattern still needs distinct
+layouts per file class.
