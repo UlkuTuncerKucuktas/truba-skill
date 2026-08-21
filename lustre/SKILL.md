@@ -481,3 +481,39 @@ cold read latency  ~  open(layout)      + 0.87 us x objects_allocated
 ```
 where `objects_with_data = min(stripe_count, ceil(size / stripe_size))`. Objects
 beyond that bound contribute only to the first two terms — they are pure cost.
+
+
+## Counting RPCs from `osc.*.rpc_stats`
+
+Sum the read column of every OSC's pages-per-rpc histogram and take deltas
+around the measured phase. **[v]** The parse was validated five ways on a
+2.15.3 client:
+
+| check | result |
+|---|---|
+| idle drift over 2 s, no I/O | 0 every time |
+| 25 / 50 / 100 files | 6.00 RPCs per file at every count |
+| re-read the same files | 6.00/file, then **0.00/file** — cache hits are not counted |
+| do the counters move on the right devices? | the set of OSCs whose counts moved was **identical** to the OST indices in `lfs getstripe` |
+| DoM files | **0.00** — the data never reaches an OST |
+
+```python
+def read_rpcs():
+    tot = 0
+    for line in os.popen("lctl get_param -n osc.*.rpc_stats").read().splitlines():
+        if "|" in line and ":" in line:
+            try: tot += int(line.split("|")[0].split(":")[1].split()[0])
+            except ValueError: pass
+    return tot
+```
+
+**[v] The RPC count depends on the application's read size, not only on the
+layout.** The same 4 MiB file on the same single OST cost **6.00** RPCs when read
+in 1 MiB `pread`s and **3.00** when read in one 4 MiB `pread`. That swing is
+larger than most layout effects, so **every arm of a comparison must use an
+identical read pattern** or the result is confounded by the benchmark rather
+than the filesystem.
+
+Counters cannot be cleared without privileges, so always take deltas, and close
+the window exactly where the measured phase ends — a window that includes file
+creation or `unlink` charges the read phase with work it never did.
