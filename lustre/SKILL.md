@@ -1055,3 +1055,44 @@ Two mechanisms visible at once:
 bandwidth knob on modern hardware. Raise it when many writers interleave within
 one file; otherwise it buys nothing and still costs ~4.4 us per object on every
 cold access.
+
+
+## The single-inode ceiling: why one big file is slow
+
+**[v]** 400 GiB, 16 threads, **all data pinned to OST 0 in both arms** so cache
+exposure and storage are identical. The only difference is how many inodes the
+work is spread over.
+
+| arm | GB/s |
+|---|---|
+| C, **one** 400 GiB file | 2.34 |
+| Python, one 400 GiB file | 2.04 |
+| C, **sixteen** 25 GiB files (same OST) | **7.88** |
+
+**Splitting one file into sixteen gave 3.4x on identical storage.** The client's
+per-inode path — shared lock tree, extent tree, page-cache structures — caps a
+single file at roughly **2.3 GB/s**, while the same OST serves **7.9 GB/s** when
+the work is spread across inodes.
+
+Python cost only 15 % against C, so an interpreted harness is not the limit here.
+
+This matches published work: Farrell et al. (CUG 2019, *Exploring Lustre
+Overstriping For Shared File Performance on Disk and Flash*) measure a **single
+object** limit of 7.1-7.5 GB/s read and 6.8-7.1 GB/s write against a full OST
+capability of 11.2-11.7 GB/s, caused by ldiskfs page-cache / ZFS ARC CPU costs,
+and note that **one client can write to a single OST at only 3-5 GB/s**.
+
+### Consequence for stripe count
+
+```
+stripes needed ~ aggregate demand on THIS FILE / per-object limit (~7 GB/s)
+```
+
+- one client, one file: demand capped near 2.3 GB/s by the inode path -> **1 stripe suffices**
+- file-per-process: every file has its own inode and object -> **striping adds nothing**
+- many ranks on one shared file: demand can far exceed one object -> **striping is essential**
+
+The last case is where the large published gains come from (OPRAEL 8.4x on
+128-process IOR writes, TOTO 4.6x). **A striping experiment run below the
+per-object limit is not a test of striping** — it measures whatever caps the
+client first, and will show a null.
