@@ -908,3 +908,37 @@ behaviour. A companion run on the capacity pool produced an implausible
 Related: shared-file access is known to lose to file-per-process because of LDLM
 extent-lock contention on one inode; Lustre's answer is **overstriping**
 (`lfs setstripe -C`, more than one stripe per OST), which was not tested here.
+
+
+## Does stripe count scale throughput? Not for a single client
+
+**[v]** The decisive test: 512 MiB files with `S=16 MiB`, so the span is 32
+objects and **every** object in every arm holds data (no arms that cannot
+differ). Exact OST sets pinned with `-o`. 4 files, T=8, 3 independent cold sets.
+
+| OSTs | disk GB/s | vs 1 | flash GB/s | vs 1 |
+|---|---|---|---|---|
+| 1 | 5.63 | 1.00x | **10.07** | 1.00x |
+| 2 | 6.61 | 1.17x | 6.87 | 0.68x |
+| 4 | **8.06** | **1.43x** | 9.44 | 0.94x |
+| 8 | 6.14 | 1.09x | 9.10 | 0.90x |
+| 16 | 4.74 | 0.84x | 6.61 | 0.66x |
+| 24 | 4.01 | 0.71x | 5.49 | 0.55x |
+
+**One OST already supplies what one client can consume**, so extra objects add
+RPC streams and per-object cost with nothing to buy. Past four OSTs throughput
+*declines*, reaching 0.55-0.71x at 24.
+
+The reason is that a modern OST is not a device. **[v]** On this system a
+capacity OST is **454 TiB** and a flash OST **81.8 TiB** — each is already a
+large array streaming several GB/s. Striping exists to aggregate devices too slow
+to feed a client; that aggregation now happens *inside* the OST.
+
+**Watch for arms that cannot differ.** An earlier version of this test used
+64 MiB files with `S=16 MiB`, giving a span of 4 — so `c=4`, `c=8` and `c=24` all
+placed data on exactly four objects and the result was necessarily flat. Always
+check `min(stripe_count, ceil(size / stripe_size))` before comparing widths.
+
+**Scope:** this concerns *single-client* throughput. Stripe count still matters
+for **capacity** (a file larger than one OST) and for **many-client aggregate**,
+neither of which is measured here.
