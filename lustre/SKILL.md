@@ -517,3 +517,72 @@ than the filesystem.
 Counters cannot be cleared without privileges, so always take deltas, and close
 the window exactly where the measured phase ends — a window that includes file
 creation or `unlink` charges the read phase with work it never did.
+
+
+## PFL dissolves the width tax
+
+Because PFL components are **instantiated lazily**, a component the file has not
+grown into has no objects — and therefore nothing to glimpse. The design notes
+say it plainly: *"If a PFL file has not created or instantiated components for
+the end of the file, then glimpse will be fast since there will be only a few
+objects allocated to the file."*
+
+**[v]** Cold, cross-node, flushed, T=1, one PFL layout
+`-E 1M -c 1 -E 64M -c 4 -E -1 -c 24` against fixed widths:
+
+| file size | layout | `fstat` | read all |
+|---|---|---|---|
+| 256 KiB | **PFL** | **53.7** | **370.3** |
+| 256 KiB | `c=1` | 51.4 | 367.5 |
+| 256 KiB | `c=24` | 134.8 | 463.3 |
+| 4 MiB | **PFL** | **74.1** | **2590.4** |
+| 4 MiB | `c=4` | 70.6 | 2563.7 |
+| 4 MiB | `c=24` | 147.9 | 2708.3 |
+
+The single PFL layout matches `c=1` on the small file **and** `c=4` on the large
+one, while the fixed wide layout pays the glimpse tax at both sizes. **One layout
+achieves the per-file optimum without knowing the file size in advance** — which
+matters because Lustre fixes the layout at first open, before the size is known.
+
+Note: `lfs getstripe` prints objects differently for composite layouts, so a
+parser that counts plain `obdidx` lines reports 0 objects for a PFL file. Count
+per component instead.
+
+## Stripe size is a spanning control
+
+**[v]** Same 4 MiB file, same `c=4`, cold:
+
+| stripe size | objects holding data | read all | BRW/file |
+|---|---|---|---|
+| 1 MiB | 4 | **2556.9 us** | 12.0 |
+| 4 MiB | 1 | 2960.0 us | 6.0 |
+
+With a 4 MiB stripe the whole file lands on one object, so the other three are
+idle and the read loses its parallelism. This confirms
+`objects_with_data = min(stripe_count, ceil(size / stripe_size))` directly:
+**stripe size and stripe count are not independent knobs.**
+
+## Pool tier: the gap is smaller than the scarcity
+
+**[v]** 4 MiB sequential read, `c=1`, cold:
+
+| pool | read all |
+|---|---|
+| `flash` | 2980.4 us |
+| `disk` | 3847.7 us |
+
+Only **1.29x**. Sequential streaming is the best case for spinning media, so the
+gap will widen for small or random reads — but on this workload the scarce tier
+buys 29 %. Choosing `-p disk` for a job that cannot use the difference returns
+capacity on the tier that is actually contended.
+
+## `lfs ladvise` — real but marginal
+
+```bash
+lfs ladvise -a willread -s 0 -e <bytes> FILE    # ask the OSS to prefetch
+```
+
+**[v]** Issued before a cold 4 MiB read: 2769.0 us versus 2980.4 us without —
+about **1.08x**. Available unprivileged, genuinely works, but not large enough to
+build on. `-a dontneed` and `-m READ|WRITE` (lock-ahead) exist on the same
+command and were not measured.
