@@ -942,3 +942,33 @@ check `min(stripe_count, ceil(size / stripe_size))` before comparing widths.
 **Scope:** this concerns *single-client* throughput. Stripe count still matters
 for **capacity** (a file larger than one OST) and for **many-client aggregate**,
 neither of which is measured here.
+
+
+## Many clients: spreading helps a little, per-file striping still does not
+
+**[v]** 8 client nodes reading **concurrently**, started together through a
+filesystem barrier, each on **private** data so no client warms the cache for
+another. 8 GiB per client = 64 GiB per arm, `S=16 MiB`, T=8 per client.
+
+| arm | OSTs | aggregate | per client | vs 1 OST |
+|---|---|---|---|---|
+| all files on ONE OST | 1 | 64.09 GB/s | 7.99 | 1.00x |
+| spread over 24 OSTs | 24 | 80.87 GB/s | 10.14 | **1.26x** |
+
+A companion run with per-file striping across 24 OSTs (rather than spreading
+files across them) gave **0.93x** — worse than file-level spreading.
+
+**Even 64 GiB concentrated on a single OST did not make that OST the
+bottleneck**: it served 64 GB/s, so its OSS cache absorbed the whole working set.
+Aggregate throughput was limited by the eight clients, each pinned at its own
+8-10 GB/s ceiling, in both arms.
+
+Producing real OST contention would need aggregate demand beyond what a target
+can supply — roughly 30-50 concurrent clients here. That is the practical limit
+of what an unprivileged benchmark on a busy production filesystem can reach.
+
+**Take-away:** file-level spreading (which Lustre's round-robin allocation gives
+for free) is worth ~1.26x at this scale; per-file stripe count is worth nothing
+and costs the width tax. Wide striping remains defensible for **capacity** (files
+larger than one OST) and plausibly at much larger client counts, neither of which
+is measured here.
