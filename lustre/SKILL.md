@@ -9,6 +9,31 @@ Facts marked **[v]** were verified by running the command on a production
 Lustre **2.15.3** filesystem (48 OSTs, 4 MDTs, two 24-OST pools). Measured
 values are illustrative of one system, not universal — read them back on yours.
 
+## Read this first
+
+Sections below were written as measurements accumulated, and **several early
+bandwidth claims were later corrected.** Where they conflict, the later section
+wins:
+
+| topic | authoritative section |
+|---|---|
+| what stripe count is worth | *The single-inode ceiling* and *When stripe count actually pays* |
+| flash vs disk striping | *Stripe size caps RPC size* (the difference was stripe size, not media) |
+| whether bulk numbers can be trusted | *Bulk throughput cannot be measured honestly from an unprivileged account* |
+
+Superseded, kept only for the reasoning: *Width: cost, benefit, and the interior
+optimum* (the interior optimum was never resolved against noise), *Why wide
+striping buys so little on flash* and *Does stripe count scale throughput* (both
+measured **below** the per-object limit, so neither was a valid test of striping).
+
+**The metadata sections are not affected.** They measure RPC *counts*, which
+caching does not change, and they reproduced six times.
+
+**One rule worth carrying everywhere:** a striping experiment run below the
+per-object bandwidth limit (~7 GB/s here) is not a test of striping — it measures
+whatever caps the client first and returns a null.
+
+
 ## Architecture
 
 | Component | Role |
