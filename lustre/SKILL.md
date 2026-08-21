@@ -1013,3 +1013,45 @@ It is **off by default** and off here, which is why the glimpse tax is what most
 sites actually pay. Turning it on is an administrator action
 (`mdt.*.enable_lsom`), and the stored size is *lazy* — accurate enough for
 scanners and policy engines, not for strict `stat()` semantics.
+
+
+## When stripe count actually pays: shared-file strided writes
+
+Prior work reports large stripe-count gains — TOTO up to **4.6x**, OPRAEL **8.4x**
+on 128-process IOR writes, DCA-IO **50%** single-app and **263%** multi-app on
+Cori, where **99.317 %** of jobs had left stripe count at the default of 1. Those
+numbers come from a specific regime, and it is worth reproducing rather than
+dismissing.
+
+**[v]** 8 ranks x 8 threads writing a 32 GiB shared file, `fsync` inside the
+timed region, `S=16 MiB`, 2 reps:
+
+| pattern | layout | aggregate GB/s | vs c=1 |
+|---|---|---|---|
+| contiguous | c=1 | 11.83 | 1.00x |
+| contiguous | c=24 | 12.19 | 1.03x |
+| **strided** | **c=1** | **7.87** | 1.00x |
+| **strided** | **c=24** | **13.22** | **1.68x** |
+| strided | `-C 48` (overstriped) | 13.49 | 1.72x |
+
+Two mechanisms visible at once:
+
+- **Strided access on an unstriped shared file costs 0.67x.** Write locks are
+  expanded by the server toward the whole file, so interleaved ranks serialise
+  against each other even though their ranges never overlap.
+- **Striping distributes the lock namespace and recovers 1.68x.** Overstriping
+  adds a further 1.02x, which is exactly the problem it was introduced to solve.
+
+**Where stripe count does *not* pay** — measured on the same system:
+
+| case | effect |
+|---|---|
+| reads, any pattern or client count | 0.55-1.26x |
+| file-per-process writes | 0.97x |
+| shared-file **contiguous** writes | 1.03x |
+| single client beyond 4 OSTs | **0.55-0.71x** |
+
+**The rule:** stripe count is a *lock-distribution* knob far more than a
+bandwidth knob on modern hardware. Raise it when many writers interleave within
+one file; otherwise it buys nothing and still costs ~4.4 us per object on every
+cold access.
