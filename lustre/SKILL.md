@@ -11,28 +11,19 @@ values are illustrative of one system, not universal — read them back on yours
 
 ## Read this first
 
-Sections below were written as measurements accumulated, and **several early
-bandwidth claims were later corrected.** Where they conflict, the later section
-wins:
+Facts marked **[v]** were verified by running the command on a production Lustre
+**2.15.3** filesystem (48 OSTs, 4 MDTs, two 24-OST pools) from an **unprivileged**
+account. Measured values illustrate one site; read them back on yours.
 
-| topic | authoritative section |
-|---|---|
-| what stripe count is worth | *The single-inode ceiling* and *When stripe count actually pays* |
-| flash vs disk striping | *Stripe size caps RPC size* (the difference was stripe size, not media) |
-| whether bulk numbers can be trusted | *Bulk throughput cannot be measured honestly from an unprivileged account* |
+Two rules that govern everything else here:
 
-Superseded, kept only for the reasoning: *Width: cost, benefit, and the interior
-optimum* (the interior optimum was never resolved against noise), *Why wide
-striping buys so little on flash* and *Does stripe count scale throughput* (both
-measured **below** the per-object limit, so neither was a valid test of striping).
-
-**The metadata sections are not affected.** They measure RPC *counts*, which
-caching does not change, and they reproduced six times.
-
-**One rule worth carrying everywhere:** a striping experiment run below the
-per-object bandwidth limit (~7 GB/s here) is not a test of striping — it measures
-whatever caps the client first and returns a null.
-
+- **Metadata costs are measurable; bulk throughput is not.** RPC *counts* do not
+  change when a server answers from cache instead of media, which is why the
+  per-object costs below reproduced six times and the GB/s figures did not.
+  Treat every throughput number as bounded by server cache.
+- **A striping experiment run below the per-object bandwidth limit (~7 GB/s
+  here) is not a test of striping.** It measures whatever caps the client first
+  and returns a null.
 
 ## Architecture
 
@@ -421,29 +412,6 @@ the counter window exactly where the measured phase ends.
   drive every worker through a `threading.Barrier` *before* starting the clock.
 
 
-## Width: cost, benefit, and the interior optimum
-
-**[v]** Cross-node, writer-flushed, median per-file latency relative to `-c 1`:
-
-| file size | spans | w=4 | w=8 | w=24 |
-|---|---|---|---|---|
-| 256 KiB (T=1) | 1 object | 1.12x | 1.12x | **1.30x** |
-| 1 MiB (T=1) | 1 object | 1.09x | 1.06x | 1.22x |
-| 4 MiB (T=1) | 4 objects | **0.88x** | **0.88x** | 0.91x |
-
-With a 1 MiB stripe, a file's data occupies `ceil(size / stripe_size)` objects
-however wide the layout is. Below that bound width is pure cost; at or above it
-width buys real parallelism. A 4 MiB file spans four objects, and the optimum
-sits at **w=4-8 — neither 1 nor the maximum** — because w=24 adds twenty empty
-objects that still cost locks.
-
-At high concurrency (T=32) the differences compress toward 1.0x: per-file
-latency is dominated by queueing rather than layout. **Record aggregate
-throughput as well as per-file latency** — at T=32 the median latency rose while
-the arms became indistinguishable, and the two numbers answer different
-questions.
-
-
 ## The read path, stage by stage
 
 **[v]** Cold, cross-node, writer-flushed, T=1, medians in microseconds. Each stage
@@ -640,34 +608,6 @@ pattern, diverged **3.7x**. Cache alone cannot produce that.
 **[v]** Both pools are served by the **same 12 OSS nodes**; disk OSTs are 454 TiB
 each against 81.8 TiB for flash. Same network, same servers, different media.
 
-## Stripe size is a spanning control
-
-**[v]** Same 4 MiB file, same `c=4`, cold:
-
-| stripe size | objects holding data | read all | BRW/file |
-|---|---|---|---|
-| 1 MiB | 4 | **2556.9 us** | 12.0 |
-| 4 MiB | 1 | 2960.0 us | 6.0 |
-
-With a 4 MiB stripe the whole file lands on one object, so the other three are
-idle and the read loses its parallelism. This confirms
-`objects_with_data = min(stripe_count, ceil(size / stripe_size))` directly:
-**stripe size and stripe count are not independent knobs.**
-
-## Pool tier: the gap is smaller than the scarcity
-
-**[v]** 4 MiB sequential read, `c=1`, cold:
-
-| pool | read all |
-|---|---|
-| `flash` | 2980.4 us |
-| `disk` | 3847.7 us |
-
-Only **1.29x**. Sequential streaming is the best case for spinning media, so the
-gap will widen for small or random reads — but on this workload the scarce tier
-buys 29 %. Choosing `-p disk` for a job that cannot use the difference returns
-capacity on the tier that is actually contended.
-
 ## `lfs ladvise` — real but marginal
 
 ```bash
@@ -814,25 +754,6 @@ per-object glimpse should behave. Five independent measurements across different
 code and days now agree: 4.40, 4.56, 4.86, 3.96 here, plus 4.52 from a staged
 decomposition and 4.79 from a run that bundled `fstat` into the read.
 
-## Striping width stops paying as concurrency rises
-
-**[v]** 4 MiB files, aggregate throughput relative to `c=1`:
-
-| threads | c=2 | c=4 | c=8 | c=24 |
-|---|---|---|---|---|
-| 1 | 0.97x | **1.17x** | 1.16x | 1.02x |
-| 4 | 1.07x | 1.11x | 1.09x | 1.05x |
-| 16 | 0.91x | 0.96x | 0.89x | 0.92x |
-
-At one reader, striping a 4 MiB file across 4-8 OSTs is worth ~17 %. **At 16
-readers every wide layout is worse than `c=1`.** With many files in flight the
-client is already spread across OSTs — file-level parallelism substitutes for
-stripe-level parallelism — so extra stripes per file add glimpse cost and buy
-nothing.
-
-Practical consequence: a multi-worker dataloader over many files wants **narrow**
-stripes, not wide ones.
-
 ## Independent file sets reveal the true variance
 
 **[v]** Re-reading the same files across "repeats" gave 1-8 % run-to-run spread.
@@ -887,117 +808,6 @@ Metadata-path costs are measurable on a production system because they are RPC
 counts. Bulk-transfer results are not, unless you can drop server caches. Treat
 the throughput tables below as *bounded by server cache*, not as media
 behaviour.
-
-## Why wide striping buys so little on flash
-
-**[v]** 24 x 64 MiB files, cold cross-node, flushed, 3 independent sets.
-Aggregate GB/s, comparing all files pinned to **one** OST against files spread
-one-per-OST and against every file striped 24-wide:
-
-| threads | one OST | spread (c=1, 16 OSTs) | wide (c=24) |
-|---|---|---|---|
-| 1 | 0.88 | 0.89 | 1.10 |
-| 2 | 1.72 | 1.72 | 2.08 |
-| 4 | 3.14 | 3.28 | 3.92 |
-| 8 | 5.47 | 5.89 | 6.61 |
-| 16 | 5.93 | 7.44 | 8.43 |
-| 32 | **7.21** | 9.08 | **10.09** |
-
-**A single OST reached 7.2 GB/s — within ~30 % of the client's ~10 GB/s
-ceiling.** Going from 1 OST to 24 bought only **1.2-1.4x** at any thread count,
-while raising client threads from 1 to 32 bought **8x**.
-
-**Client concurrency is the dominant lever; stripe width is a minor one.**
-
-The reason is historical. Striping exists to aggregate devices that are
-individually too slow to feed a client. With HDD-era OSTs at 100-200 MB/s you
-needed tens of stripes to saturate a client. On flash, one target already
-supplies most of what a single client can consume, so the saturation bound is:
-
-```
-useful_stripes ~ min( ceil(size / stripe_size),          # spanning bound
-                      client_ceiling / per_OST_rate )    # saturation bound
-```
-
-**[v]** On this system the saturation bound is roughly **2**. Every object beyond
-it costs 4.44 us of glimpse on each cold access and returns nothing.
-
-**Caveat, and it is a large one:** the one-OST figure of 7.2 GB/s is far above
-what a single storage target should sustain from media, so these reads were
-substantially served from OSS cache. The *relative* comparison at equal cache
-state is still informative — width bought 1.2-1.4x while threads bought 8x — but
-do not read the absolute rates, or the flash-versus-disk comparison, as media
-behaviour. A companion run on the capacity pool produced an implausible
-11.68 GB/s, confirming that the servers, not the disks, were answering.
-
-Related: shared-file access is known to lose to file-per-process because of LDLM
-extent-lock contention on one inode; Lustre's answer is **overstriping**
-(`lfs setstripe -C`, more than one stripe per OST), which was not tested here.
-
-
-## Does stripe count scale throughput? Not for a single client
-
-**[v]** The decisive test: 512 MiB files with `S=16 MiB`, so the span is 32
-objects and **every** object in every arm holds data (no arms that cannot
-differ). Exact OST sets pinned with `-o`. 4 files, T=8, 3 independent cold sets.
-
-| OSTs | disk GB/s | vs 1 | flash GB/s | vs 1 |
-|---|---|---|---|---|
-| 1 | 5.63 | 1.00x | **10.07** | 1.00x |
-| 2 | 6.61 | 1.17x | 6.87 | 0.68x |
-| 4 | **8.06** | **1.43x** | 9.44 | 0.94x |
-| 8 | 6.14 | 1.09x | 9.10 | 0.90x |
-| 16 | 4.74 | 0.84x | 6.61 | 0.66x |
-| 24 | 4.01 | 0.71x | 5.49 | 0.55x |
-
-**One OST already supplies what one client can consume**, so extra objects add
-RPC streams and per-object cost with nothing to buy. Past four OSTs throughput
-*declines*, reaching 0.55-0.71x at 24.
-
-The reason is that a modern OST is not a device. **[v]** On this system a
-capacity OST is **454 TiB** and a flash OST **81.8 TiB** — each is already a
-large array streaming several GB/s. Striping exists to aggregate devices too slow
-to feed a client; that aggregation now happens *inside* the OST.
-
-**Watch for arms that cannot differ.** An earlier version of this test used
-64 MiB files with `S=16 MiB`, giving a span of 4 — so `c=4`, `c=8` and `c=24` all
-placed data on exactly four objects and the result was necessarily flat. Always
-check `min(stripe_count, ceil(size / stripe_size))` before comparing widths.
-
-**Scope:** this concerns *single-client* throughput. Stripe count still matters
-for **capacity** (a file larger than one OST) and for **many-client aggregate**,
-neither of which is measured here.
-
-
-## Many clients: spreading helps a little, per-file striping still does not
-
-**[v]** 8 client nodes reading **concurrently**, started together through a
-filesystem barrier, each on **private** data so no client warms the cache for
-another. 8 GiB per client = 64 GiB per arm, `S=16 MiB`, T=8 per client.
-
-| arm | OSTs | aggregate | per client | vs 1 OST |
-|---|---|---|---|---|
-| all files on ONE OST | 1 | 64.09 GB/s | 7.99 | 1.00x |
-| spread over 24 OSTs | 24 | 80.87 GB/s | 10.14 | **1.26x** |
-
-A companion run with per-file striping across 24 OSTs (rather than spreading
-files across them) gave **0.93x** — worse than file-level spreading.
-
-**Even 64 GiB concentrated on a single OST did not make that OST the
-bottleneck**: it served 64 GB/s, so its OSS cache absorbed the whole working set.
-Aggregate throughput was limited by the eight clients, each pinned at its own
-8-10 GB/s ceiling, in both arms.
-
-Producing real OST contention would need aggregate demand beyond what a target
-can supply — roughly 30-50 concurrent clients here. That is the practical limit
-of what an unprivileged benchmark on a busy production filesystem can reach.
-
-**Take-away:** file-level spreading (which Lustre's round-robin allocation gives
-for free) is worth ~1.26x at this scale; per-file stripe count is worth nothing
-and costs the width tax. Wide striping remains defensible for **capacity** (files
-larger than one OST) and plausibly at much larger client counts, neither of which
-is measured here.
-
 
 ## Other read-side features: what exists, what is on, what helps
 
