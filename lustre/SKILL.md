@@ -1213,3 +1213,29 @@ LNet baselines are unobtainable, so an application-level number cannot be
 attributed to a layer. Metadata **RPC counts** are attributable because they do
 not depend on those layers — which is why they reproduced and the throughput
 numbers did not.
+
+
+## What a trace cannot tell you about a file
+
+Relevant to anyone deciding layouts from observed I/O rather than from the
+application.
+
+**A trace gives counts and bytes. It does not give the critical path.** A file
+can dominate read time and block nothing (prefetching hides it), while another
+takes 3 ms and gates every rank. Whether accelerating a file helps end-to-end
+depends on its share of the critical path, and that is a property of the
+program's dependency structure.
+
+Three concrete blind spots:
+
+- **A startup file read once, that everything waits on**, ranks last by any
+  frequency-or-size metric and first by criticality. Small gating files are also
+  the cheapest DoM candidates — large benefit, negligible MDT capacity.
+- **Short profiling runs miss periodic writes.** Checkpoints happen every N
+  steps, so a short run may produce none — and shared-file strided writes are the
+  one regime where stripe count measurably matters.
+- **Re-reads served from cache save nothing**, so the useful weight is
+  `reads × (1 − cache ÷ working_set)`, not raw reads.
+
+Practical consequence: when tuning layout from a profile, check whether the
+profile actually exercised the file classes you are deciding about.
